@@ -37,20 +37,25 @@ def process_link(query: Query): # Changed from 'data: dict' to 'query: Query'
         
         system_prompt = """
         You are an expert operator and strategist. 
-        Analyze the following content and produce a detailed structured output.
+        Analyze the following podcast transcript and produce a detailed structured output.
         
         Requirements:
         - Do NOT oversimplify. Preserve examples and stories.
         - Extract non-obvious insights only.
-        - Output sections: 
-          ## Executive Summary (SCR)
-          ## Epiphanies / Learnings (with explanations & examples)
-          ## Core Concepts (definition + when to apply)
-          ## Action Items (Immediate, 30-90 days, Long-term)
-          ## Follow-up Questions
-          ## Controversial Opinions [Unverified]
-          ## 3 'If True' Scenarios (12-36 months)
-          ## Personal Reflection Prompts
+        - Use clear, structured thinking.
+        
+        Output sections:
+        ## Executive Summary (SCR: Situation, Complication, Resolution)
+        ## Epiphanies / Learnings (Include explanation, why it matters, and concrete examples)
+        ## Core Concepts (Define clearly + when to apply)
+        ## Action Items (Immediate, 30-90 days, Long-term)
+        ## Follow-up Questions
+        ## Controversial Opinions [Label [Unverified] if speculative]
+        ## 3 'If True' Scenarios (12-36 months)
+        ## Personal Reflection Prompts
+        
+        At the end include:
+        Source: {{URL}}
         """
 
         response = client.models.generate_content(
