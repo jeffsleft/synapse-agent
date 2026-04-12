@@ -34,9 +34,28 @@ def process_link(query: Query): # Changed from 'data: dict' to 'query: Query'
 
         # 2. Think with Flash (Reliable on Free Tier)
         client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        
+        system_prompt = """
+        You are an expert operator and strategist. 
+        Analyze the following content and produce a detailed structured output.
+        
+        Requirements:
+        - Do NOT oversimplify. Preserve examples and stories.
+        - Extract non-obvious insights only.
+        - Output sections: 
+          ## Executive Summary (SCR)
+          ## Epiphanies / Learnings (with explanations & examples)
+          ## Core Concepts (definition + when to apply)
+          ## Action Items (Immediate, 30-90 days, Long-term)
+          ## Follow-up Questions
+          ## Controversial Opinions [Unverified]
+          ## 3 'If True' Scenarios (12-36 months)
+          ## Personal Reflection Prompts
+        """
+
         response = client.models.generate_content(
             model="gemini-2.0-flash", 
-            contents=[f"Provide a high-level strategic summary of this: {raw_content}"]
+            contents=[system_prompt, f"Source Content: {raw_content}"]
         )
         synthesis = response.text
 
