@@ -56,3 +56,5 @@ def process_link(query: Query): # Changed from 'data: dict' to 'query: Query'
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         return {"status": "error", "message": str(e)}
+
+    # Updated April 2026
