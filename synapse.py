@@ -48,7 +48,7 @@ def process_link(query: Query):
         """
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash", 
+            model="gemini-2.0-flash-001", 
             contents=[system_prompt, f"Source Content: {raw_content}"]
         )
         synthesis = response.text
