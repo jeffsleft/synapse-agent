@@ -34,9 +34,14 @@ def process_link(query: Query):
         content_res = requests.get(reader_url, headers=headers)
         
         page_title = content_res.headers.get("x-respond-title", "Untitled Source")
-        # Capture current date for Notion
         process_date = datetime.now().strftime("%Y-%m-%d") 
         raw_content = content_res.text[:30000]
+
+        # --- NEW: Twitter/X Noise Filter ---
+        if "x.com" in url or "twitter.com" in url:
+            # Truncate content to avoid sidebar/trending topics noise
+            raw_content = raw_content[:1500] 
+            print("🐦 Twitter Filter Applied: Truncating sidebar noise.")
 
         # 2. Think with Gemini 3 Flash
         client = genai.Client(
@@ -44,19 +49,18 @@ def process_link(query: Query):
             http_options={'api_version': 'v1beta'}
         )
         
+        # Updated with Literalist Guardrails to prevent hallucinations
         system_prompt = f"""
-        You are an expert operator. 
-        IMPORTANT: Your response must start with a # followed by a concise, punchy title. 
-        DO NOT include any introductory sentences or preamble. 
-        Start immediately with:
-        # [Title]
+        You are a literalist Strategic Analyst. 
         
-        Analyze the following content and produce a detailed structured output.
+        CRITICAL RULES:
+        1. Start immediately with '# [Punchy Title]'. No intro text or "This analysis is based on...".
+        2. DO NOT invent philosophy or external context. Only analyze the provided text.
+        3. If you see sidebar noise (like "Who to follow" or "Trending"), IGNORE IT.
+        4. Focus 100% on the PRIMARY CONTENT of the source.
+        5. If a section is not applicable (e.g., a very short tweet), write "N/A for this content."
         
-        Requirements:
-        - Preserve examples and stories. Extract non-obvious insights.
-        
-        Output sections:
+        Produce these exact headers:
         ## Executive Summary (SCR)
         ## Epiphanies / Learnings
         ## Core Concepts
@@ -78,14 +82,12 @@ def process_link(query: Query):
         # --- 3. Logic & Cleaning ---
         lines = [l.strip() for l in synthesis.split('\n') if l.strip()]
         
-        # Grab title from the first line and remove markdown #
         raw_title = lines[0].replace('#', '').strip() if lines else "New Analysis"
-        generated_title = ' '.join(raw_title.split()[:12]) # Keep title punchy
+        generated_title = ' '.join(raw_title.split()[:12])
         
-        # Table snippet for Synthesis column
-        table_synthesis = synthesis[:1500].strip() + "..."
+        # Update Synthesis for the table view
+        table_synthesis = synthesis[:1800].strip() + "..."
 
-        # Extraction for the Action Items and Scenarios columns
         action_items_snippet = "No specific actions identified."
         scenarios_snippet = "No scenarios identified."
         
@@ -106,7 +108,6 @@ def process_link(query: Query):
                 block_type = "heading_2"
                 content = content.replace('##', '').strip()
             
-            # Notion block character limit handling
             if len(content) > 2000:
                 for chunk in [content[i:i+2000] for i in range(0, len(content), 2000)]:
                     text_blocks.append({
