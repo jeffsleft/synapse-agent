@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Synapse</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; }
+    .spinner { animation: spin 1s linear infinite; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen flex flex-col items-center justify-center p-6">
+
+  <div class="w-full max-w-xl space-y-6">
+
+    <!-- Header -->
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Synapse</h1>
+      <p class="text-gray-400 text-sm mt-1">Drop in a URL. Get a structured learning note in Notion.</p>
+    </div>
+
+    <!-- Main form -->
+    <div class="bg-gray-900 rounded-xl p-6 space-y-4 border border-gray-800">
+      <div>
+        <label class="block text-sm text-gray-400 mb-1">URL</label>
+        <input
+          id="url-input"
+          type="url"
+          placeholder="https://..."
+          class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          autofocus
+        />
+      </div>
+
+      <button
+        id="submit-btn"
+        class="w-full bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-medium py-3 rounded-lg text-sm transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+      >
+        Process
+      </button>
+    </div>
+
+    <!-- Result -->
+    <div id="result" class="hidden bg-gray-900 rounded-xl p-5 border border-gray-800 text-sm space-y-2"></div>
+
+    <!-- Settings (collapsed) -->
+    <details class="text-xs text-gray-500">
+      <summary class="cursor-pointer hover:text-gray-300 transition-colors">Settings</summary>
+      <div class="mt-3 bg-gray-900 rounded-xl p-4 border border-gray-800 space-y-3">
+        <div>
+          <label class="block text-gray-400 mb-1">Modal endpoint URL</label>
+          <input
+            id="endpoint-input"
+            type="url"
+            placeholder="https://your-app--synapse-agent-process-link.modal.run"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-gray-200 placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          />
+        </div>
+        <div>
+          <label class="block text-gray-400 mb-1">Passcode (optional)</label>
+          <input
+            id="passcode-input"
+            type="password"
+            placeholder="Leave blank if not configured"
+            class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-gray-200 placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          />
+        </div>
+        <button
+          id="save-settings-btn"
+          class="bg-gray-700 hover:bg-gray-600 text-gray-200 px-3 py-1.5 rounded-lg transition-colors"
+        >
+          Save
+        </button>
+        <p id="settings-saved" class="hidden text-green-400">Saved.</p>
+      </div>
+    </details>
+
+  </div>
+
+  <script>
+    const LS_ENDPOINT = 'synapse_endpoint';
+    const LS_PASSCODE = 'synapse_passcode';
+
+    const urlInput = document.getElementById('url-input');
+    const submitBtn = document.getElementById('submit-btn');
+    const resultEl = document.getElementById('result');
+    const endpointInput = document.getElementById('endpoint-input');
+    const passcodeInput = document.getElementById('passcode-input');
+    const saveSettingsBtn = document.getElementById('save-settings-btn');
+    const settingsSaved = document.getElementById('settings-saved');
+
+    // Load saved settings
+    endpointInput.value = localStorage.getItem(LS_ENDPOINT) || '';
+    passcodeInput.value = localStorage.getItem(LS_PASSCODE) || '';
+
+    saveSettingsBtn.addEventListener('click', () => {
+      localStorage.setItem(LS_ENDPOINT, endpointInput.value.trim());
+      localStorage.setItem(LS_PASSCODE, passcodeInput.value);
+      settingsSaved.classList.remove('hidden');
+      setTimeout(() => settingsSaved.classList.add('hidden'), 2000);
+    });
+
+    function showResult(type, content) {
+      resultEl.classList.remove('hidden');
+      const colors = { success: 'text-green-400', error: 'text-red-400', warn: 'text-yellow-400', info: 'text-blue-400' };
+      resultEl.innerHTML = `<span class="${colors[type] || 'text-gray-300'}">${content}</span>`;
+    }
+
+    function setLoading(loading) {
+      submitBtn.disabled = loading;
+      submitBtn.innerHTML = loading
+        ? `<svg class="spinner w-4 h-4" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" stroke-dasharray="50 30" /></svg> Processing...`
+        : 'Process';
+    }
+
+    async function submit() {
+      const url = urlInput.value.trim();
+      const endpoint = (localStorage.getItem(LS_ENDPOINT) || '').trim();
+      const passcode = localStorage.getItem(LS_PASSCODE) || '';
+
+      if (!url) { showResult('warn', 'Enter a URL first.'); return; }
+      if (!endpoint) {
+        showResult('warn', 'Configure your Modal endpoint URL in Settings.');
+        document.querySelector('details').open = true;
+        return;
+      }
+
+      setLoading(true);
+      resultEl.classList.add('hidden');
+
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (passcode) headers['x-passcode'] = passcode;
+
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ url }),
+        });
+
+        const data = await res.json();
+
+        if (data.status === 'success') {
+          showResult('success', `Done. <a href="${data.notion_url}" target="_blank" class="underline hover:text-green-300">Open in Notion →</a>`);
+          urlInput.value = '';
+        } else if (data.status === 'duplicate') {
+          showResult('info', `Already processed. <a href="${data.notion_url}" target="_blank" class="underline hover:text-blue-300">Open existing note →</a>`);
+        } else if (data.status === 'unsupported') {
+          showResult('warn', data.message);
+        } else {
+          showResult('error', data.message || 'Something went wrong.');
+        }
+      } catch (err) {
+        showResult('error', `Request failed: ${err.message}`);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    submitBtn.addEventListener('click', submit);
+    urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  </script>
+</body>
+</html>
