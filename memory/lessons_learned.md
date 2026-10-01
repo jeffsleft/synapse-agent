@@ -4,6 +4,24 @@ Per `AI_RULES.md` §4 — technical failures and their resolutions are logged he
 
 ---
 
+## 2026-10-01 — Gemini 503 overload surfaced as a generic error
+
+### Symptom
+Every submission returned `{"status":"error","message":"Processing failed. Check Modal logs for details."}`. Modal logs showed the fetch and Twitter filter succeeding, then `503 UNAVAILABLE ... This model is currently experiencing high demand`.
+
+### Root cause
+`_gemini_generate()` only caught `genai_errors.ClientError` (4xx). A 503 is a `ServerError`, so it skipped the handler and hit the catch-all in `process_link`, which returns the generic message. The outage itself was on Google's side and temporary.
+
+### Fix
+`_gemini_generate()` now catches `ServerError`: retry once on `MODEL` after 2s, then fall back to `FALLBACK_MODEL` (`gemini-flash-lite-latest`, overridable via `SYNAPSE_FALLBACK_MODEL`), then raise a `ValueError` with "Gemini is temporarily overloaded. Try again in a minute." 429 billing/rate-limit handling is unchanged and still fails fast.
+
+### Rules
+- **Handle `ServerError` separately from `ClientError` on Gemini calls.** 4xx means fix the request or billing; 5xx means transient, so retry briefly or fall back.
+- **Overload is often per-model.** A fallback to a lighter model is cheaper and faster than long backoff, and keeps the call inside the iOS Shortcut's ~60s timeout (see 2026-05-29: no long backoff on this interactive endpoint).
+- Check the logs for `Used fallback model` to see how often the fallback fires.
+
+---
+
 ## 2026-05-29 — Gemini billing exhaustion caused iOS Shortcut timeouts
 
 ### Symptom
