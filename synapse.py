@@ -1,7 +1,6 @@
 import modal
 import os
 import time
-import re
 from pydantic import BaseModel
 from urllib.parse import urlparse
 from typing import Annotated
@@ -11,6 +10,7 @@ CONTENT_CAP = int(os.environ.get("SYNAPSE_CONTENT_CAP", "30000"))
 TWITTER_CAP = int(os.environ.get("SYNAPSE_TWITTER_CAP", "1500"))
 NOTION_BLOCK_LIMIT = 2000
 MODEL = os.environ.get("SYNAPSE_MODEL", "gemini-flash-latest")
+FALLBACK_MODEL = os.environ.get("SYNAPSE_FALLBACK_MODEL", "gemini-flash-lite-latest")
 
 PODCAST_DOMAINS = {
     "open.spotify.com", "podcasts.apple.com", "podcasts.google.com",
@@ -18,20 +18,15 @@ PODCAST_DOMAINS = {
     "simplecast.com", "podbean.com", "transistor.fm", "player.fm",
 }
 
-YOUTUBE_DOMAINS = {"youtube.com", "www.youtube.com", "youtu.be", "m.youtube.com"}
-
 # Private/metadata IPs to block (SSRF protection)
 _BLOCKED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254", "::1")
 
-# Gemini backoff delays in seconds (AI_RULES §1)
-_BACKOFF_DELAYS = (15, 30, 60, 120, 240)
 
 image = modal.Image.debian_slim().pip_install(
     "google-genai",
-    "notion-client",
     "requests",
+    "firecrawl-py",
     "fastapi[standard]",
-    "youtube-transcript-api",
 )
 app = modal.App("synapse-agent")
 
@@ -74,52 +69,32 @@ def _detect_unsupported(url: str) -> str | None:
     return None
 
 
-def _is_youtube(url: str) -> bool:
-    hostname = (urlparse(url).hostname or "").lower()
-    return hostname in YOUTUBE_DOMAINS
-
-
-def _fetch_youtube_transcript(url: str) -> tuple[str, str]:
-    """Returns (transcript_text, video_title). Lazy-imports youtube-transcript-api."""
-    from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
-
-    video_id = None
-    for pattern in (r"[?&]v=([a-zA-Z0-9_-]{11})", r"youtu\.be/([a-zA-Z0-9_-]{11})"):
-        m = re.search(pattern, url)
-        if m:
-            video_id = m.group(1)
-            break
-
-    if not video_id:
-        raise ValueError("Could not extract YouTube video ID from URL.")
-
-    try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-    except (NoTranscriptFound, TranscriptsDisabled):
-        raise ValueError("No transcript available for this YouTube video. Try a video with auto-captions or CC enabled.")
-
-    text = " ".join(t["text"] for t in transcript_list)
-    return text[:CONTENT_CAP], f"YouTube video ({video_id})"
-
 
 def _gemini_generate(client, contents: list) -> str:
-    """Calls Gemini with exponential backoff on RESOURCE_EXHAUSTED (AI_RULES §1)."""
+    """Calls Gemini. Fails fast on rate limit and billing exhaustion — no retries.
+    Interactive tool: return a clear error immediately so the caller can retry."""
     from google.genai import errors as genai_errors
 
-    last_exc = None
-    for i, delay in enumerate(_BACKOFF_DELAYS):
+    # Overload (503/500) is often per-model: retry once on the primary, then fall back.
+    for attempt, model in enumerate((MODEL, MODEL, FALLBACK_MODEL)):
         try:
-            response = client.models.generate_content(model=MODEL, contents=contents)
+            response = client.models.generate_content(model=model, contents=contents)
+            if model != MODEL:
+                print(f"⚠️ Used fallback model {model}")
             return response.text
+        except genai_errors.ServerError as e:
+            print(f"⚠️ Gemini server error on {model} (attempt {attempt + 1}): {e}")
+            if attempt == 0:
+                time.sleep(2)
+            continue
         except genai_errors.ClientError as e:
-            if "RESOURCE_EXHAUSTED" in str(e):
-                last_exc = e
-                if i < len(_BACKOFF_DELAYS) - 1:
-                    print(f"⏳ Gemini rate limited, retrying in {delay}s... (attempt {i+1})")
-                    time.sleep(delay)
-            else:
-                raise
-    raise last_exc
+            error_str = str(e)
+            if "RESOURCE_EXHAUSTED" in error_str:
+                if any(kw in error_str.lower() for kw in ("credits", "prepayment", "billing")):
+                    raise ValueError("Gemini credits depleted. Top up at https://aistudio.google.com/app/plan")
+                raise ValueError("Gemini is rate limited. Wait a few seconds and try again.")
+            raise
+    raise ValueError("Gemini is temporarily overloaded. Try again in a minute.")
 
 
 def _build_text_blocks(synthesis: str) -> list:
@@ -151,6 +126,22 @@ def _build_text_blocks(synthesis: str) -> list:
     return text_blocks
 
 
+def _notion_request(method: str, path: str, token: str, **kwargs) -> dict:
+    import requests
+    resp = requests.request(
+        method,
+        f"https://api.notion.com/v1{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        },
+        **kwargs,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # Main endpoint
 # ---------------------------------------------------------------------------
@@ -159,7 +150,6 @@ def _build_text_blocks(synthesis: str) -> list:
 @modal.fastapi_endpoint(method="POST")
 def process_link(query: Query, x_passcode: Annotated[str | None, "Header"] = None):
     from google import genai
-    from notion_client import Client
     import requests
     from datetime import datetime
 
@@ -183,28 +173,70 @@ def process_link(query: Query, x_passcode: Annotated[str | None, "Header"] = Non
 
         process_date = datetime.now().strftime("%Y-%m-%d")
 
-        # 1. Fetch content — YouTube transcript or Jina scrape
-        if _is_youtube(url):
-            raw_content, page_title = _fetch_youtube_transcript(url)
-            print(f"🎬 YouTube transcript fetched ({len(raw_content)} chars)")
-        else:
+        # 1. Fetch content — plain requests first, Jina fallback for thin/failed responses
+        _BROWSER_UA = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+        page_title = "Untitled Source"
+        raw_content = ""
+
+        try:
+            plain_res = requests.get(url, headers={"User-Agent": _BROWSER_UA}, timeout=15)
+            if plain_res.ok and len(plain_res.text) >= 500:
+                raw_content = plain_res.text[:CONTENT_CAP]
+                # Best-effort title from <title> tag
+                title_match = __import__("re").search(r"<title[^>]*>([^<]+)</title>", plain_res.text, __import__("re").IGNORECASE)
+                if title_match:
+                    page_title = title_match.group(1).strip()[:200].replace("\n", " ").replace("```", "")
+                print(f"📄 Plain fetch succeeded ({len(raw_content)} chars)")
+        except Exception as e:
+            print(f"⚠️ Plain fetch failed: {e}")
+
+        if len(raw_content) < 500:
+            print("⚠️ Thin or failed plain fetch — falling back to Jina.")
             reader_url = f"https://r.jina.ai/{url}"
-            headers = {"Authorization": f"Bearer {os.environ['JINA_API_KEY']}"}
-            content_res = requests.get(reader_url, headers=headers)
+            jina_headers = {"Authorization": f"Bearer {os.environ['JINA_API_KEY']}"}
+            jina_res = requests.get(reader_url, headers=jina_headers, timeout=30)
+            if jina_res.ok:
+                page_title = jina_res.headers.get("x-respond-title", page_title)
+                page_title = page_title[:200].replace("\n", " ").replace("```", "")
+                raw_content = jina_res.text[:CONTENT_CAP]
+                print(f"🔁 Jina fallback succeeded ({len(raw_content)} chars)")
+            else:
+                print(f"⚠️ Jina failed (HTTP {jina_res.status_code}) — falling back to Firecrawl.")
 
-            page_title = content_res.headers.get("x-respond-title", "Untitled Source")
-            page_title = page_title[:200].replace("\n", " ").replace("```", "")
-            raw_content = content_res.text[:CONTENT_CAP]
+        if len(raw_content) < 300:
+            print("⚠️ Thin content after Jina — falling back to Firecrawl.")
+            try:
+                from firecrawl import FirecrawlApp
+                fc = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
+                fc_result = fc.scrape_url(url, formats=["markdown"])
+                if fc_result and fc_result.markdown:
+                    raw_content = fc_result.markdown[:CONTENT_CAP]
+                    if fc_result.metadata and fc_result.metadata.get("title"):
+                        page_title = fc_result.metadata["title"][:200].replace("\n", " ").replace("```", "")
+                    print(f"🔥 Firecrawl fallback succeeded ({len(raw_content)} chars)")
+                else:
+                    raise ValueError("Failed to fetch content from all sources. Check the URL and try again.")
+            except ImportError:
+                raise ValueError("Firecrawl not available. Check Modal image configuration.")
+            except Exception as e:
+                if isinstance(e, ValueError):
+                    raise
+                raise ValueError(f"Firecrawl failed: {e}. Check the URL and try again.")
 
-            if "x.com" in url or "twitter.com" in url:
-                raw_content = raw_content[:TWITTER_CAP]
-                print("🐦 Twitter filter applied.")
+        if "x.com" in url or "twitter.com" in url:
+            raw_content = raw_content[:TWITTER_CAP]
+            print("🐦 Twitter filter applied.")
 
         # 2. Deduplication check
-        notion = Client(auth=os.environ["NOTION_TOKEN"])
-        existing = notion.databases.query(
-            database_id=os.environ["NOTION_DATABASE_ID"],
-            filter={"property": "URL", "url": {"equals": url}}
+        notion_token = os.environ["NOTION_TOKEN"]
+        db_id = os.environ["NOTION_DATABASE_ID"]
+        existing = _notion_request(
+            "POST", f"/databases/{db_id}/query", notion_token,
+            json={"filter": {"property": "URL", "url": {"equals": url}}}
         )
         if existing.get("results"):
             existing_page_url = existing["results"][0].get("url")
@@ -257,18 +289,21 @@ def process_link(query: Query, x_passcode: Annotated[str | None, "Header"] = Non
             scenarios_snippet = synthesis.split("## 3 'If True' Scenarios")[1].split("##")[0].strip()[:1800]
 
         # 5. Write to Notion
-        new_page = notion.pages.create(
-            parent={"database_id": os.environ["NOTION_DATABASE_ID"]},
-            properties={
-                "Name": {"title": [{"text": {"content": generated_title}}]},
-                "URL": {"url": url},
-                "Date": {"date": {"start": process_date}},
-                "Status": {"status": {"name": "New"}},
-                "Synthesis": {"rich_text": [{"type": "text", "text": {"content": table_synthesis}}]},
-                "Action Items": {"rich_text": [{"type": "text", "text": {"content": action_items_snippet}}]},
-                "Key Scenarios": {"rich_text": [{"type": "text", "text": {"content": scenarios_snippet}}]}
-            },
-            children=_build_text_blocks(synthesis)
+        new_page = _notion_request(
+            "POST", "/pages", notion_token,
+            json={
+                "parent": {"database_id": db_id},
+                "properties": {
+                    "Name": {"title": [{"text": {"content": generated_title}}]},
+                    "URL": {"url": url},
+                    "Date": {"date": {"start": process_date}},
+                    "Status": {"status": {"name": "New"}},
+                    "Synthesis": {"rich_text": [{"type": "text", "text": {"content": table_synthesis}}]},
+                    "Action Items": {"rich_text": [{"type": "text", "text": {"content": action_items_snippet}}]},
+                    "Key Scenarios": {"rich_text": [{"type": "text", "text": {"content": scenarios_snippet}}]},
+                },
+                "children": _build_text_blocks(synthesis),
+            }
         )
 
         return {"status": "success", "notion_url": new_page.get("url")}
@@ -292,10 +327,9 @@ def process_link(query: Query, x_passcode: Annotated[str | None, "Header"] = Non
 )
 def weekly_rollup():
     from google import genai
-    from notion_client import Client
     from datetime import datetime, timedelta
 
-    notion = Client(auth=os.environ["NOTION_TOKEN"])
+    notion_token = os.environ["NOTION_TOKEN"]
     db_id = os.environ["NOTION_DATABASE_ID"]
 
     seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -303,13 +337,15 @@ def weekly_rollup():
 
     print(f"📅 Weekly rollup: {seven_days_ago} → {today}")
 
-    results = notion.databases.query(
-        database_id=db_id,
-        filter={
-            "and": [
-                {"property": "Status", "status": {"equals": "New"}},
-                {"property": "Date", "date": {"on_or_after": seven_days_ago}},
-            ]
+    results = _notion_request(
+        "POST", f"/databases/{db_id}/query", notion_token,
+        json={
+            "filter": {
+                "and": [
+                    {"property": "Status", "status": {"equals": "New"}},
+                    {"property": "Date", "date": {"on_or_after": seven_days_ago}},
+                ]
+            }
         }
     ).get("results", [])
 
@@ -322,15 +358,18 @@ def weekly_rollup():
     # Build combined input from each entry's Synthesis property
     combined = []
     page_ids = []
+    sources = []  # (title, url) tuples for LinkedIn post
     for page in results:
         title = ""
         if page["properties"].get("Name", {}).get("title"):
             title = page["properties"]["Name"]["title"][0]["text"]["content"]
+        url_prop = page["properties"].get("URL", {}).get("url", "")
         synthesis_blocks = page["properties"].get("Synthesis", {}).get("rich_text", [])
         synthesis_text = synthesis_blocks[0]["text"]["content"] if synthesis_blocks else ""
         if synthesis_text:
             combined.append(f"### {title}\n{synthesis_text}")
             page_ids.append(page["id"])
+            sources.append((title, url_prop))
 
     if not combined:
         print("Entries found but no synthesis content — skipping rollup.")
@@ -366,23 +405,79 @@ def weekly_rollup():
     digest_title = f"Weekly Digest — {seven_days_ago} to {today}"
 
     # Write digest to Notion
-    notion.pages.create(
-        parent={"database_id": db_id},
-        properties={
-            "Name": {"title": [{"text": {"content": digest_title}}]},
-            "Date": {"date": {"start": today}},
-            "Status": {"status": {"name": "New"}},
-            "Synthesis": {"rich_text": [{"type": "text", "text": {"content": digest[:1800]}}]},
-        },
-        children=_build_text_blocks(digest)
+    _notion_request(
+        "POST", "/pages", notion_token,
+        json={
+            "parent": {"database_id": db_id},
+            "properties": {
+                "Name": {"title": [{"text": {"content": digest_title}}]},
+                "Date": {"date": {"start": today}},
+                "Status": {"status": {"name": "New"}},
+                "Synthesis": {"rich_text": [{"type": "text", "text": {"content": digest[:1800]}}]},
+            },
+            "children": _build_text_blocks(digest),
+        }
     )
+
+    # Generate LinkedIn reading roundup draft
+    # VOICE NOTE: This prompt uses a structural placeholder voice.
+    # Replace the voice instruction block below with output from ~/projects/voice-engine
+    # when that tool is ready.
+    sources_block = "\n".join(
+        f"- {title}: {url}" for title, url in sources if url
+    )
+    linkedin_prompt = f"""
+    You are drafting a weekly LinkedIn post called "What I've been reading."
+
+    VOICE: Direct, specific, no corporate filler. Written for GTM/CS ops leaders and
+    curious professionals. No "I'm excited to share" or "game-changer" language.
+    Conversational but substantive. First person. Show the thinking, not just the conclusion.
+
+    FORMAT (modeled on Farnam Street Brain Food):
+    - Opening line: one sentence that sets the week's theme or a provocative observation.
+    - 4-5 "tiny thoughts": each is 2-3 sentences. Lead with the insight, end with why it matters.
+      Include the source link naturally in the text (e.g. "This piece from [Title] made me think...").
+    - One standout quote: brief attribution.
+    - One "If True" scenario: 2-3 sentences on the most interesting speculative thread from the week.
+    - Closing line: one sentence. A question or an invitation to react. No "let me know your thoughts."
+
+    RULES:
+    - Do not use headers or bullet points in the final post — LinkedIn prose only.
+    - Separate each section with a blank line.
+    - Total length: 200-280 words.
+    - Only use insights from the provided source material. Do not invent.
+
+    Week: {seven_days_ago} to {today}
+
+    Sources read this week:
+    {sources_block}
+    """
+
+    time.sleep(5)  # AI_RULES §1 pacing between sequential LLM calls
+    linkedin_draft = _gemini_generate(genai_client, [linkedin_prompt, f"Weekly digest material:\n\n{source_block}"])
+    linkedin_title = f"LinkedIn Draft — {seven_days_ago} to {today}"
+
+    _notion_request(
+        "POST", "/pages", notion_token,
+        json={
+            "parent": {"database_id": db_id},
+            "properties": {
+                "Name": {"title": [{"text": {"content": linkedin_title}}]},
+                "Date": {"date": {"start": today}},
+                "Status": {"status": {"name": "Draft"}},
+                "Synthesis": {"rich_text": [{"type": "text", "text": {"content": linkedin_draft[:1800]}}]},
+            },
+            "children": _build_text_blocks(linkedin_draft),
+        }
+    )
+    print(f"📝 LinkedIn draft written: {linkedin_title}")
 
     # Mark source entries as Synthesized (requires "Synthesized" status in your Notion DB)
     for page_id in page_ids:
         try:
-            notion.pages.update(
-                page_id=page_id,
-                properties={"Status": {"status": {"name": "Synthesized"}}}
+            _notion_request(
+                "PATCH", f"/pages/{page_id}", notion_token,
+                json={"properties": {"Status": {"status": {"name": "Synthesized"}}}}
             )
         except Exception as e:
             print(f"⚠️ Could not update status for {page_id}: {e}")
